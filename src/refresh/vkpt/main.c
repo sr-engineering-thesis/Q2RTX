@@ -2960,6 +2960,7 @@ prepare_ubo(refdef_t *fd, mleaf_t* viewleaf, const reference_mode_t* ref_mode, c
 void
 R_RenderFrame_RTX(refdef_t *fd)
 {
+	Cvar_SetInteger(cvar_dump_image, 1, FROM_CODE);
 	if (!qvk.swap_chain)
 		return;
 
@@ -3296,12 +3297,6 @@ R_RenderFrame_RTX(refdef_t *fd)
 		}
 		END_PERF_MARKER(post_cmd_buf, PROFILER_BLOOM);
 
-#ifdef VKPT_IMAGE_DUMPS
-		if (cvar_dump_image->integer)
-		{
-			copy_to_dump_texture(post_cmd_buf, VKPT_IMG_TAA_OUTPUT);
-		}
-#endif
 
 		BEGIN_PERF_MARKER(post_cmd_buf, PROFILER_TONE_MAPPING);
 		if (cvar_tm_enable->integer != 0)
@@ -3578,6 +3573,27 @@ retry:;
 	SCR_SetHudAlpha(1.f);
 }
 
+void save_raw_image(screenshot_t *s, unsigned long frame_counter) {
+
+	static int image_counter = 0;
+	if(image_counter >= 5000) {
+		printf("Done writing images!\n");
+		return;
+	}
+	if (frame_counter % 60 == 0) return;
+
+	char fileName[128];
+	sprintf(fileName, "frames/%d.bin", image_counter);
+
+	FILE* file = fopen(fileName, "wb");
+	if (file)
+	{
+		fwrite(s->pixels, 1, s->height*s->width * 3, file);
+		fclose(file);
+		image_counter++;
+	}
+}
+
 void
 R_EndFrame_RTX(void)
 {
@@ -3623,6 +3639,15 @@ R_EndFrame_RTX(void)
 		frame_ready = false;
 	}
 
+	screenshot_t s;
+#ifdef VKPT_IMAGE_DUMPS
+		if (cvar_dump_image->integer)
+		{
+			IMG_ReadPixels_RTX(&s);
+			save_raw_image(&s, qvk.frame_counter);
+			free (s.pixels);
+		}
+#endif
 	vkpt_draw_submit_stretch_pics(cmd_buf);
 
 	VkSemaphore wait_semaphores[] = { qvk.semaphores[qvk.current_frame_index][0].image_available };
@@ -4070,7 +4095,7 @@ IMG_ReadPixels_RTX(screenshot_t *s)
 	_VK(vkMapMemory(qvk.device, qvk.screenshot_image_memory, 0, qvk.screenshot_image_memory_size, 0, &device_data));
 	
 	int pitch = qvk.extent_unscaled.width * 3;
-	s->pixels = FS_AllocTempMem(pitch * qvk.extent_unscaled.height);
+	s->pixels = malloc(pitch * qvk.extent_unscaled.height);
 
 	for (int row = 0; row < qvk.extent_unscaled.height; row++)
 	{
