@@ -45,6 +45,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include <vulkan/vulkan.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
+#include <dirent.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -3574,13 +3575,27 @@ retry:;
 }
 
 void save_raw_image(screenshot_t *s, unsigned long frame_counter) {
-
+	static int counted_images = 0;
 	static int image_counter = 0;
-	if(image_counter >= 5000) {
-		printf("Done writing images!\n");
-		return;
+	static int capture_second_image = 0;
+	if (!counted_images) {
+		int file_count = 0;
+		DIR * dirp;
+		struct dirent * entry;
+
+		dirp = opendir("frames"); 
+		while ((entry = readdir(dirp)) != NULL) {
+			if (entry->d_type == DT_REG) {
+				 file_count++;
+			}
+		}
+		closedir(dirp);
+		printf("There are alread %d images\n", file_count);
+		image_counter = file_count;
+		counted_images = 1;
 	}
-	if (frame_counter % 60 == 0) return;
+
+	if (!capture_second_image && frame_counter % (1*60) != 0) return;
 
 	char fileName[128];
 	sprintf(fileName, "frames/%d.bin", image_counter);
@@ -3590,7 +3605,13 @@ void save_raw_image(screenshot_t *s, unsigned long frame_counter) {
 	{
 		fwrite(s->pixels, 1, s->height*s->width * 3, file);
 		fclose(file);
+		printf("Saved%s\n", fileName);
 		image_counter++;
+		if(!capture_second_image) {
+			capture_second_image = 1;
+		} else {
+			capture_second_image = 0;
+		}
 	}
 }
 
@@ -3670,28 +3691,6 @@ R_EndFrame_RTX(void)
 		qvk.device_count, signal_semaphores, signal_device_indices,
 		qvk.fences_frame_sync[qvk.current_frame_index]);
 
-
-#ifdef VKPT_IMAGE_DUMPS
-	if (cvar_dump_image->integer) {
-		_VK(vkQueueWaitIdle(qvk.queue_graphics));
-
-		VkImageSubresource subresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			.arrayLayer = 0,
-			.mipLevel = 0
-		};
-
-		VkSubresourceLayout subresource_layout;
-		vkGetImageSubresourceLayout(qvk.device, qvk.dump_image, &subresource, &subresource_layout);
-
-		void *data;
-		_VK(vkMapMemory(qvk.device, qvk.dump_image_memory, 0, qvk.dump_image_memory_size, 0, &data));
-		save_to_pfm_file("color_buffer", qvk.frame_counter, IMG_WIDTH, IMG_HEIGHT, (char *)data, subresource_layout.rowPitch, 0);
-		vkUnmapMemory(qvk.device, qvk.dump_image_memory);
-
-		Cvar_SetInteger(cvar_dump_image, 0, FROM_CODE);
-	}
-#endif
 
 	VkPresentInfoKHR present_info = {
 		.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
