@@ -3978,120 +3978,138 @@ typedef struct {
 	sem_t full;
 } SharedFrameSynchronization;
 
-void
-share_pixels()
+void share_pixels()
 {
-	static int initialized = 0;
-	static SharedFrameSynchronization* pixel_meta_data = NULL;
-	static byte *pixel_data = NULL;
-	if(!initialized) {
-		int meta_data_fd = shm_open("/shared_frame_meta_data", O_RDWR | O_CREAT , 0666);
-		size_t meta_data_size = sizeof(SharedFrameSynchronization);
-		ftruncate(meta_data_fd, meta_data_size);
-		pixel_meta_data = mmap(NULL, meta_data_size, PROT_READ | PROT_WRITE, MAP_SHARED, meta_data_fd, 0);
+    static int initialized = 0;
+    static SharedFrameSynchronization* pixel_meta_data = NULL;
+    static byte *pixel_data = NULL;
 
-		int frame_fd = shm_open("/shared_frame", O_RDWR | O_CREAT , 0666);
-		size_t shared_frame_size = 2560 * 4 * 1440;
-		ftruncate(frame_fd, shared_frame_size);
-		pixel_data = mmap(NULL, shared_frame_size, PROT_READ | PROT_WRITE, MAP_SHARED, frame_fd, 0);
-		sem_init(&(pixel_meta_data->mutex), 1, 1);
-		sem_init(&(pixel_meta_data->empty), 1, 1);
-		sem_init(&(pixel_meta_data->full),  1, 0);
-		initialized = 1;
-	}
+    static VkBuffer staging_buffers[2];
+    static VkDeviceMemory staging_memories[2];
+    static int current_buffer = 0;
 
-	if (qvk.surf_format.format != VK_FORMAT_B8G8R8A8_SRGB &&
-		qvk.surf_format.format != VK_FORMAT_R8G8B8A8_SRGB)
-	{
-		Com_EPrintf("IMG_ReadPixels: unsupported swap chain format (%d)!\n", qvk.surf_format.format);
-		return;
-	}
+    if(!initialized) {
+        // --- Shared Memory Initialization ---
+        int meta_data_fd = shm_open("/shared_frame_meta_data", O_RDWR | O_CREAT, 0666);
+        size_t meta_data_size = sizeof(SharedFrameSynchronization);
+        ftruncate(meta_data_fd, meta_data_size);
+        pixel_meta_data = mmap(NULL, meta_data_size, PROT_READ | PROT_WRITE, MAP_SHARED, meta_data_fd, 0);
 
-	VkCommandBuffer cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
+        int frame_fd = shm_open("/shared_frame", O_RDWR | O_CREAT, 0666);
+        size_t shared_frame_size = 2560 * 4 * 1440;
+        ftruncate(frame_fd, shared_frame_size);
+        pixel_data = mmap(NULL, shared_frame_size, PROT_READ | PROT_WRITE, MAP_SHARED, frame_fd, 0);
 
-	VkImage swap_chain_image = qvk.swap_chain_images[qvk.current_swap_chain_image_index];
+        sem_init(&(pixel_meta_data->mutex), 1, 1);
+        sem_init(&(pixel_meta_data->empty), 1, 1);
+        sem_init(&(pixel_meta_data->full), 1, 0);
 
-	VkImageSubresourceRange subresource_range = {
-		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-		.baseMipLevel = 0,
-		.levelCount = 1,
-		.baseArrayLayer = 0,
-		.layerCount = 1
-	};
-		
-	IMAGE_BARRIER(cmd_buf,
-		.image = swap_chain_image,
-		.subresourceRange = subresource_range,
-		.srcAccessMask = 0,
-		.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-		.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-	);
+        // --- Vulkan Staging Buffers (Double-Buffered) ---
+        VkDeviceSize buffer_size = qvk.extent_unscaled.width * qvk.extent_unscaled.height * 4;
 
-	IMAGE_BARRIER(cmd_buf,
-		.image = qvk.screenshot_image,
-		.subresourceRange = subresource_range,
-		.srcAccessMask = VK_ACCESS_HOST_READ_BIT,
-		.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-	);
+        VkBufferCreateInfo buffer_info = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        buffer_info.size = buffer_size;
+        buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-	VkImageCopy img_copy_region = {
-		.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-		.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-		.extent = { qvk.extent_unscaled.width, qvk.extent_unscaled.height, 1 }
-	};
+        VkMemoryAllocateInfo mem_info = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
 
-	vkCmdCopyImage(cmd_buf,
-		swap_chain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		qvk.screenshot_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		1, &img_copy_region);
+        VkMemoryRequirements mem_reqs;
 
-	IMAGE_BARRIER(cmd_buf,
-		.image = swap_chain_image,
-		.subresourceRange = subresource_range,
-		.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		.dstAccessMask = 0,
-		.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
-	);
+        for (int i = 0; i < 2; ++i) {
+            vkCreateBuffer(qvk.device, &buffer_info, NULL, &staging_buffers[i]);
+            vkGetBufferMemoryRequirements(qvk.device, staging_buffers[i], &mem_reqs);
 
-	IMAGE_BARRIER(cmd_buf,
-		.image = qvk.screenshot_image,
-		.subresourceRange = subresource_range,
-		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		.dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-		.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		.newLayout = VK_IMAGE_LAYOUT_GENERAL
-	);
+            mem_info.allocationSize = mem_reqs.size;
+			mem_info.memoryTypeIndex = get_memory_type(
+				mem_reqs.memoryTypeBits,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+			);
 
-	vkpt_submit_command_buffer_simple(cmd_buf, qvk.queue_graphics, false);
-	vkpt_wait_idle(qvk.queue_graphics, &qvk.cmd_buffers_graphics);
 
-	VkImageSubresource subresource = {
-		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-		.arrayLayer = 0,
-		.mipLevel = 0
-	};
+            vkAllocateMemory(qvk.device, &mem_info, NULL, &staging_memories[i]);
+            vkBindBufferMemory(qvk.device, staging_buffers[i], staging_memories[i], 0);
+        }
 
-	VkSubresourceLayout subresource_layout;
-	vkGetImageSubresourceLayout(qvk.device, qvk.screenshot_image, &subresource, &subresource_layout);
+        initialized = 1;
+    }
 
-	void *device_data;
-	_VK(vkMapMemory(qvk.device, qvk.screenshot_image_memory, 0, qvk.screenshot_image_memory_size, 0, &device_data));
-	int pitch = qvk.extent_unscaled.width * 4;
-	sem_wait(&(pixel_meta_data->empty));
-	sem_wait(&(pixel_meta_data->mutex));
-	memcpy(pixel_data, device_data, pitch * qvk.extent_unscaled.height);
+    if (qvk.surf_format.format != VK_FORMAT_B8G8R8A8_SRGB &&
+        qvk.surf_format.format != VK_FORMAT_R8G8B8A8_SRGB)
+    {
+        Com_EPrintf("IMG_ReadPixels: unsupported swap chain format (%d)!\n", qvk.surf_format.format);
+        return;
+    }
 
-	vkUnmapMemory(qvk.device, qvk.screenshot_image_memory);
+    // --- Begin Command Buffer ---
+    VkCommandBuffer cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
+    VkImage swap_chain_image = qvk.swap_chain_images[qvk.current_swap_chain_image_index];
 
-	pixel_meta_data->width = qvk.extent_unscaled.width;
-	pixel_meta_data->height = qvk.extent_unscaled.height;
-	pixel_meta_data->pitch = pitch;
-	sem_post(&(pixel_meta_data->mutex));
-	sem_post(&(pixel_meta_data->full));
+    VkImageSubresourceRange subresource_range = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    };
+
+    // Transition swapchain image to transfer src
+    IMAGE_BARRIER(cmd_buf,
+        .image = swap_chain_image,
+        .subresourceRange = subresource_range,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    );
+
+    // Copy to staging buffer
+    VkBufferImageCopy copy_region = {0};
+    copy_region.bufferOffset = 0;
+    copy_region.bufferRowLength = 0; // tightly packed
+    copy_region.bufferImageHeight = 0;
+    copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy_region.imageSubresource.layerCount = 1;
+    copy_region.imageExtent.width = qvk.extent_unscaled.width;
+    copy_region.imageExtent.height = qvk.extent_unscaled.height;
+    copy_region.imageExtent.depth = 1;
+
+    vkCmdCopyImageToBuffer(cmd_buf,
+        swap_chain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        staging_buffers[current_buffer],
+        1, &copy_region
+    );
+
+    // Transition back
+    IMAGE_BARRIER(cmd_buf,
+        .image = swap_chain_image,
+        .subresourceRange = subresource_range,
+        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .dstAccessMask = 0,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+    );
+
+    vkpt_submit_command_buffer_simple(cmd_buf, qvk.queue_graphics, false);
+
+    // --- Map staging buffer ---
+    void* mapped_data;
+    vkMapMemory(qvk.device, staging_memories[current_buffer], 0,
+                qvk.extent_unscaled.width * qvk.extent_unscaled.height * 4, 0, &mapped_data);
+
+    sem_wait(&(pixel_meta_data->empty));
+    sem_wait(&(pixel_meta_data->mutex));
+
+    int pitch = qvk.extent_unscaled.width * 4;
+    memcpy(pixel_data, mapped_data, pitch * qvk.extent_unscaled.height);
+
+    sem_post(&(pixel_meta_data->mutex));
+    sem_post(&(pixel_meta_data->full));
+
+    vkUnmapMemory(qvk.device, staging_memories[current_buffer]);
+
+    // Rotate buffer for next frame
+    current_buffer = 1 - current_buffer;
 }
 // for screenshots
 void
