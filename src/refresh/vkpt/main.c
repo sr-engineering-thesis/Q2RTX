@@ -55,6 +55,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <semaphore.h>
+#include <stdio.h>
+#include <time.h>
 
 cvar_t *cvar_profiler = NULL;
 cvar_t *cvar_profiler_samples = NULL;
@@ -3976,6 +3978,7 @@ typedef struct {
 	sem_t mutex;
 	sem_t empty;
 	sem_t full;
+	long gpu_to_cpu_time;
 } SharedFrameSynchronization;
 
 void share_pixels()
@@ -3996,7 +3999,7 @@ void share_pixels()
         pixel_meta_data = mmap(NULL, meta_data_size, PROT_READ | PROT_WRITE, MAP_SHARED, meta_data_fd, 0);
 
         int frame_fd = shm_open("/shared_frame", O_RDWR | O_CREAT, 0666);
-        size_t shared_frame_size = 2560 * 4 * 1440;
+        size_t shared_frame_size = 1280 * 4 * 720;
         ftruncate(frame_fd, shared_frame_size);
         pixel_data = mmap(NULL, shared_frame_size, PROT_READ | PROT_WRITE, MAP_SHARED, frame_fd, 0);
 
@@ -4040,6 +4043,8 @@ void share_pixels()
         Com_EPrintf("IMG_ReadPixels: unsupported swap chain format (%d)!\n", qvk.surf_format.format);
         return;
     }
+	struct timespec start, end;
+	clock_gettime(CLOCK_MONOTONIC, &start);
 
     // --- Begin Command Buffer ---
     VkCommandBuffer cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
@@ -4100,14 +4105,17 @@ void share_pixels()
     sem_wait(&(pixel_meta_data->empty));
     sem_wait(&(pixel_meta_data->mutex));
 
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    // Compute elapsed time in milliseconds
+    pixel_meta_data->gpu_to_cpu_time = (end.tv_sec - start.tv_sec) * 1000 +
+              (end.tv_nsec - start.tv_nsec) / 1000000;
+
     int pitch = qvk.extent_unscaled.width * 4;
     memcpy(pixel_data, mapped_data, pitch * qvk.extent_unscaled.height);
-
     sem_post(&(pixel_meta_data->mutex));
     sem_post(&(pixel_meta_data->full));
 
     vkUnmapMemory(qvk.device, staging_memories[current_buffer]);
-
     // Rotate buffer for next frame
     current_buffer = 1 - current_buffer;
 }
