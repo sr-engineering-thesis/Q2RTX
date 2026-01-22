@@ -51,6 +51,10 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <semaphore.h>
 
 cvar_t *cvar_profiler = NULL;
 cvar_t *cvar_profiler_samples = NULL;
@@ -3574,46 +3578,7 @@ retry:;
 	SCR_SetHudAlpha(1.f);
 }
 
-void save_raw_image(screenshot_t *s, unsigned long frame_counter) {
-	static int counted_images = 0;
-	static int image_counter = 0;
-	static int capture_second_image = 0;
-	if (!counted_images) {
-		int file_count = 0;
-		DIR * dirp;
-		struct dirent * entry;
-
-		dirp = opendir("frames"); 
-		while ((entry = readdir(dirp)) != NULL) {
-			if (entry->d_type == DT_REG) {
-				 file_count++;
-			}
-		}
-		closedir(dirp);
-		printf("There are alread %d images\n", file_count);
-		image_counter = file_count;
-		counted_images = 1;
-	}
-
-	if (!capture_second_image && frame_counter % (1*60) != 0) return;
-
-	char fileName[128];
-	sprintf(fileName, "frames/%d.bin", image_counter);
-
-	FILE* file = fopen(fileName, "wb");
-	if (file)
-	{
-		fwrite(s->pixels, 1, s->height*s->width * 3, file);
-		fclose(file);
-		printf("Saved%s\n", fileName);
-		image_counter++;
-		if(!capture_second_image) {
-			capture_second_image = 1;
-		} else {
-			capture_second_image = 0;
-		}
-	}
-}
+void share_pixels();
 
 void
 R_EndFrame_RTX(void)
@@ -3660,15 +3625,10 @@ R_EndFrame_RTX(void)
 		frame_ready = false;
 	}
 
-	screenshot_t s;
-#ifdef VKPT_IMAGE_DUMPS
-		if (cvar_dump_image->integer)
-		{
-			IMG_ReadPixels_RTX(&s);
-			save_raw_image(&s, qvk.frame_counter);
-			free (s.pixels);
-		}
-#endif
+	if (cvar_dump_image->integer)
+	{
+		share_pixels();
+	}
 	vkpt_draw_submit_stretch_pics(cmd_buf);
 
 	VkSemaphore wait_semaphores[] = { qvk.semaphores[qvk.current_frame_index][0].image_available };
@@ -4008,6 +3968,131 @@ R_Shutdown_RTX(bool total)
 	vid.shutdown();
 }
 
+
+typedef struct {
+	int width;
+	int height;
+	int pitch;
+	sem_t mutex;
+	sem_t empty;
+	sem_t full;
+} SharedFrameSynchronization;
+
+void
+share_pixels()
+{
+	static int initialized = 0;
+	static SharedFrameSynchronization* pixel_meta_data = NULL;
+	static byte *pixel_data = NULL;
+	if(!initialized) {
+		int meta_data_fd = shm_open("/shared_frame_meta_data", O_RDWR | O_CREAT , 0666);
+		size_t meta_data_size = sizeof(SharedFrameSynchronization);
+		ftruncate(meta_data_fd, meta_data_size);
+		pixel_meta_data = mmap(NULL, meta_data_size, PROT_READ | PROT_WRITE, MAP_SHARED, meta_data_fd, 0);
+
+		int frame_fd = shm_open("/shared_frame", O_RDWR | O_CREAT , 0666);
+		size_t shared_frame_size = 2560 * 4 * 1440;
+		ftruncate(frame_fd, shared_frame_size);
+		pixel_data = mmap(NULL, shared_frame_size, PROT_READ | PROT_WRITE, MAP_SHARED, frame_fd, 0);
+		sem_init(&(pixel_meta_data->mutex), 1, 1);
+		sem_init(&(pixel_meta_data->empty), 1, 1);
+		sem_init(&(pixel_meta_data->full),  1, 0);
+		initialized = 1;
+	}
+
+	if (qvk.surf_format.format != VK_FORMAT_B8G8R8A8_SRGB &&
+		qvk.surf_format.format != VK_FORMAT_R8G8B8A8_SRGB)
+	{
+		Com_EPrintf("IMG_ReadPixels: unsupported swap chain format (%d)!\n", qvk.surf_format.format);
+		return;
+	}
+
+	VkCommandBuffer cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
+
+	VkImage swap_chain_image = qvk.swap_chain_images[qvk.current_swap_chain_image_index];
+
+	VkImageSubresourceRange subresource_range = {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1
+	};
+		
+	IMAGE_BARRIER(cmd_buf,
+		.image = swap_chain_image,
+		.subresourceRange = subresource_range,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+	);
+
+	IMAGE_BARRIER(cmd_buf,
+		.image = qvk.screenshot_image,
+		.subresourceRange = subresource_range,
+		.srcAccessMask = VK_ACCESS_HOST_READ_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+	);
+
+	VkImageCopy img_copy_region = {
+		.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+		.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+		.extent = { qvk.extent_unscaled.width, qvk.extent_unscaled.height, 1 }
+	};
+
+	vkCmdCopyImage(cmd_buf,
+		swap_chain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		qvk.screenshot_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		1, &img_copy_region);
+
+	IMAGE_BARRIER(cmd_buf,
+		.image = swap_chain_image,
+		.subresourceRange = subresource_range,
+		.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		.dstAccessMask = 0,
+		.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+	);
+
+	IMAGE_BARRIER(cmd_buf,
+		.image = qvk.screenshot_image,
+		.subresourceRange = subresource_range,
+		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		.newLayout = VK_IMAGE_LAYOUT_GENERAL
+	);
+
+	vkpt_submit_command_buffer_simple(cmd_buf, qvk.queue_graphics, false);
+	vkpt_wait_idle(qvk.queue_graphics, &qvk.cmd_buffers_graphics);
+
+	VkImageSubresource subresource = {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.arrayLayer = 0,
+		.mipLevel = 0
+	};
+
+	VkSubresourceLayout subresource_layout;
+	vkGetImageSubresourceLayout(qvk.device, qvk.screenshot_image, &subresource, &subresource_layout);
+
+	void *device_data;
+	_VK(vkMapMemory(qvk.device, qvk.screenshot_image_memory, 0, qvk.screenshot_image_memory_size, 0, &device_data));
+	int pitch = qvk.extent_unscaled.width * 4;
+	sem_wait(&(pixel_meta_data->empty));
+	sem_wait(&(pixel_meta_data->mutex));
+	memcpy(pixel_data, device_data, pitch * qvk.extent_unscaled.height);
+
+	vkUnmapMemory(qvk.device, qvk.screenshot_image_memory);
+
+	pixel_meta_data->width = qvk.extent_unscaled.width;
+	pixel_meta_data->height = qvk.extent_unscaled.height;
+	pixel_meta_data->pitch = pitch;
+	sem_post(&(pixel_meta_data->mutex));
+	sem_post(&(pixel_meta_data->full));
+}
 // for screenshots
 void
 IMG_ReadPixels_RTX(screenshot_t *s)
