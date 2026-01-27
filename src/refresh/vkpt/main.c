@@ -2961,7 +2961,9 @@ prepare_ubo(refdef_t *fd, mleaf_t* viewleaf, const reference_mode_t* ref_mode, c
 void
 R_RenderFrame_RTX(refdef_t *fd)
 {
+#ifdef VKPT_IMAGE_DUMPS
 	Cvar_SetInteger(cvar_dump_image, 1, FROM_CODE);
+#endif
 	if (!qvk.swap_chain)
 		return;
 
